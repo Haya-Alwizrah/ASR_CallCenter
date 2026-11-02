@@ -12,9 +12,8 @@ load_dotenv(ROOT / ".env")
 RESULTS = ROOT / os.getenv("RESULTS_DIR", "results")
 
 st.set_page_config(page_title="Call Center Analysis", page_icon="🎧", layout="wide")
-st.title("Call Center Agent Performance Analysis")
+st.title("Call Center Agent")
 st.write("Upload a call to see its transcript, summary, and customer sentiment.")
-
 
 def format_time(seconds):
     if seconds is None:
