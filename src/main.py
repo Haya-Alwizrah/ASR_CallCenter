@@ -1,12 +1,3 @@
-"""Local VS Code entrypoint for WhisperX transcription and AppTek evaluation.
-
-Examples:
-  python -m src.main transcribe --audio data/sample.wav
-  python -m src.main evaluate --limit 10 --reuse
-  python -m src.main analyze --input results/sample.json
-  python -m src.main analyze --input-dir results --reuse
-"""
-from __future__ import annotations
 import argparse
 import json
 import os
@@ -16,55 +7,47 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 
-def setting(name: str, default: str) -> str:
-    return os.getenv(name, default)
-
 def build_transcriber(*, keep_asr_loaded: bool | None = None):
-    # Delay heavy imports so ``python -m src.main --help`` works before ML setup.
     from src.pipeline import CallCenterWhisperX
 
     token = os.getenv("HF_TOKEN", "").strip()
-    if not token or token == "hf_your_read_token_here":
-        raise RuntimeError("Set HF_TOKEN in your local .env and accept Pyannote model access.")
-    device = setting("DEVICE", "auto")
-    compute = setting("COMPUTE_TYPE", "auto")
-    speakers = setting("NUM_SPEAKERS", "2")
+    device = os.getenv("DEVICE", "auto")
+    compute = os.getenv("COMPUTE_TYPE", "auto")
+    speakers = os.getenv("NUM_SPEAKERS", "2")
 
     return CallCenterWhisperX(
-        hf_token=token,
-        model_name=setting("MODEL_NAME", "small"),
-        language=setting("LANGUAGE", "en") or None,
-        device=None if device == "auto" else device,
-        compute_type=None if compute == "auto" else compute,
-        batch_size=int(setting("BATCH_SIZE", "4")),
-        num_speakers=None if speakers.lower() in ("auto", "none") else int(speakers),
-        keep_asr_loaded=(setting("KEEP_ASR_LOADED", "false").lower() in ("1", "true", "yes")
-                            if keep_asr_loaded is None else keep_asr_loaded),
+        hf_token = token,
+        model_name = os.getenv("MODEL_NAME", "small"),
+        language = os.getenv("LANGUAGE", "en") or None,
+        device = None if device == "auto" else device,
+        compute_type = None if compute == "auto" else compute,
+        batch_size = int(os.getenv("BATCH_SIZE", "4")),
+        num_speakers = None if speakers.lower() in ("auto", "none") else int(speakers),
+        keep_asr_loaded = os.getenv("KEEP_ASR_LOADED", "false").lower() in ("1", "true", "yes") if keep_asr_loaded is None else keep_asr_loaded,
     )
 
 class CallProcessingService:
-    """One-call orchestration shared by Streamlit and optional CLI commands."""
-
-    def __init__(self, *, preload: bool = True):
+    def __init__(self, preload=True):
         self.transcriber = build_transcriber(keep_asr_loaded=True)
         if preload:
             self.transcriber.load_models()
 
-    def process(self, audio_path: Path, *, output_dir: Path | None = None) -> dict:
+    def process(self, audio_path, output_dir=None):
         from src.llm import CallLLM
-        out_dir = output_dir or ROOT / setting("RESULTS_DIR", "results")
+        out_dir = output_dir or ROOT / os.getenv("RESULTS_DIR", "results")
         out_dir.mkdir(parents=True, exist_ok=True)
         prediction_path = out_dir / f"{audio_path.stem}.json"
         transcript = self.transcriber.transcribe(audio_path, prediction_path)
         analysis_path = out_dir / "summaries" / f"{audio_path.stem}_summary.json"
-        # Do not overwrite an existing transcript/summary on API failure.
         analysis = CallLLM().analyze(transcript, analysis_path)
-        return {"transcript": transcript, "analysis": analysis,
-                "transcript_path": prediction_path, "analysis_path": analysis_path}
+        
+        return {
+            "transcript": transcript, "analysis": analysis,
+            "transcript_path": prediction_path, "analysis_path": analysis_path
+        }
 
-    def close(self) -> None:
+    def close(self):
         self.transcriber.close()
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="WhisperX speaker-attributed call analysis")
@@ -84,7 +67,7 @@ def main() -> None:
     p_analysis.add_argument("--output-dir", type=Path, default=None, help="Batch output folder")
     p_analysis.add_argument("--reuse", action="store_true", help="Reuse analysis JSON if sentiment is already present")
     args = parser.parse_args()
-    default_results = ROOT / setting("RESULTS_DIR", "results")
+    default_results = ROOT / os.getenv("RESULTS_DIR", "results")
 
     if args.command == "transcribe":
         output = args.output or default_results / f"{args.audio.stem}.json"
@@ -114,8 +97,6 @@ def main() -> None:
         transcriber = build_transcriber()
 
         try:
-            # Skip GPU model initialization if all predictions can be reused;
-            # transcribe() will lazy-load if a prediction is missing.
             if not args.reuse:
                 print("Loading ASR model before evaluation...")
                 transcriber.load_models()
@@ -123,9 +104,7 @@ def main() -> None:
             runner = AppTekEvaluationRunner(
                 transcriber=transcriber,
                 evaluator=CallEvaluator(normalize=True),
-                audio_loader=AppTekAudioLoader(
-                    local_dir=ROOT / setting("APPTEK_CACHE_DIR", "data/apptek_audio")
-                ),
+                audio_loader=AppTekAudioLoader(local_dir=ROOT / os.getenv("APPTEK_CACHE_DIR", "data/apptek_audio")),
             )
 
             report = runner.run(
@@ -139,6 +118,7 @@ def main() -> None:
 
             if report["summary"]["successful_calls"] == 0:
                 raise RuntimeError("No calls succeeded. Check failures.json.")
+        
         finally:
             transcriber.close()
 

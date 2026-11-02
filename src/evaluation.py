@@ -1,35 +1,28 @@
-"""AppTek diarization test-set adapter and reproducible WER/CER/DER evaluation."""
 from __future__ import annotations
-
 import json
 import re
 import statistics
-import time
 from pathlib import Path
 from typing import Any
-
 import jiwer
 from pyannote.core import Annotation, Segment
 from pyannote.metrics.diarization import DiarizationErrorRate
-
 
 class AppTekDataset:
     DATASET_ID = "apptek-com/apptek_callcenter_dialogues"
 
     @staticmethod
     def stream(limit: int | None = None):
-        """Stream complete mixed-speaker calls; do not download all 873 at once."""
         from datasets import Audio, load_dataset
         from itertools import islice
         ds = load_dataset(AppTekDataset.DATASET_ID, "diarization", split="test", streaming=True)
-        # Avoid TorchCodec decoding dependencies; raw WAV bytes stay available.
+
         if "audio" in ds.column_names:
             ds = ds.cast_column("audio", Audio(decode=False))
         return islice(ds, limit) if limit is not None else iter(ds)
 
     @staticmethod
     def audio_to_file(row: dict[str, Any], folder: str | Path) -> Path:
-        """Export one HF audio row to an actual local file for WhisperX."""
         path = Path(folder)
         path.mkdir(parents=True, exist_ok=True)
         audio = row.get("audio")
@@ -48,13 +41,6 @@ class AppTekDataset:
 
 
 class AppTekAudioLoader:
-    """Download the public WAV matching an AppTek diarization row.
-
-    Dataset rows may contain audio=None; file_name is relative to the
-    accent-specific directory in the dataset repository. Downloads are cached
-    by huggingface_hub, and exact suffix matching prevents wrong-accent files.
-    """
-
     def __init__(self, repo_id: str = AppTekDataset.DATASET_ID,
                  local_dir: str | Path = "data/apptek_audio"):
         self.repo_id = repo_id
@@ -87,13 +73,6 @@ class AppTekAudioLoader:
 
 
 class CallEvaluator:
-    """Reference comparison using full-call text and raw diarization intervals.
-
-    WER/CER: concatenated reference/predicted segment text in chronological order.
-    DER: pyannote optimal speaker permutation, collar=0, overlap included.
-    Roles: reference roles only; model speakers mapped for analysis, never inference.
-    """
-
     def __init__(self, normalize: bool = True):
         self.normalize = normalize
         self.der_metric = DiarizationErrorRate(collar=0.0, skip_overlap=False)
@@ -101,7 +80,6 @@ class CallEvaluator:
     def _normalize(self, text: str) -> str:
         if not self.normalize:
             return text.strip()
-        # Simple transparent normalization (NOT AppTek's full official scorer).
         text = text.lower()
         text = re.sub(r"[^\w\s']", " ", text)
         return " ".join(text.split())
@@ -124,16 +102,11 @@ class CallEvaluator:
         hyp_segments = sorted(prediction["segments"], key=lambda s: (s["start"], s["end"]))
         ref_text = self._normalize(" ".join(str(s.get("text", "")) for s in ref_segments))
         hyp_text = self._normalize(" ".join(str(s.get("text", "")) for s in hyp_segments))
-        if not ref_text:
-            raise ValueError("Reference transcript is empty; WER cannot be computed.")
 
         reference = self._annotation(ref_segments, "speaker_id")
         hypothesis = self._annotation(prediction.get("diarization", []), "speaker")
-        if not prediction.get("diarization"):
-            raise ValueError("No raw diarization spans in prediction; cannot compute DER correctly.")
         details = self.der_metric.compute_components(reference, hypothesis)
         der = self.der_metric.compute_metric(details)
-        # Store raw edit counts so the aggregate WER/CER is truly corpus-level.
         word_ops = jiwer.process_words(ref_text, hyp_text)
         char_ops = jiwer.process_characters(ref_text, hyp_text)
         def counts(ops):
@@ -142,7 +115,6 @@ class CallEvaluator:
                 "deletions": int(ops.deletions), "insertions": int(ops.insertions),
                 "reference_units": int(ops.hits + ops.substitutions + ops.deletions),
             }
-        # Reference roles are only used for post-hoc analysis; no role labels inferred here.
         return {
             "call_id": prediction.get("call_id"),
             "reference_file": reference_row.get("file_name"),
@@ -177,15 +149,10 @@ class CallEvaluator:
         pd.DataFrame(metrics).drop(columns=["der_components_seconds", "evaluation_notes", "word_counts", "char_counts"], errors="ignore").to_csv(
             out / "metrics.csv", index=False
         )
-        # The summary is written by AppTekEvaluationRunner after all calls finish.
 
     @staticmethod
     def aggregate(metrics: list[dict[str, Any]]) -> dict[str, Any]:
-        """Pooled/corpus-level rates, never an average of per-call percentages.
-
-        WER/CER aggregate raw jiwer edit counts. DER aggregates pyannote
-        components (seconds) before computing its ratio. RTF is duration-weighted.
-        """
+        """Compute corpus metrics from total errors, not averaged call percentages."""
         if not metrics:
             return {"wer": None, "cer": None, "der": None, "rtf": None}
 
@@ -194,8 +161,6 @@ class CallEvaluator:
             total = {k: 0 for k in keys}
             for row in metrics:
                 counts = row.get(key)
-                if not isinstance(counts, dict):
-                    raise ValueError(f"Missing {key}. Re-evaluate calls using updated evaluation.py.")
                 for k in keys:
                     total[k] += int(counts[k])
             denom = total["reference_units"]
@@ -210,8 +175,6 @@ class CallEvaluator:
         seconds = {k: 0.0 for k in der_keys}
         for row in metrics:
             components = row.get("der_components_seconds")
-            if not isinstance(components, dict):
-                raise ValueError("Missing DER components. Re-evaluate calls using updated evaluation.py.")
             for k in der_keys:
                 seconds[k] += float(components.get(k, 0))
         der = ((seconds["confusion"] + seconds["false alarm"] + seconds["missed detection"])
@@ -240,11 +203,6 @@ class CallEvaluator:
 
 
 class AppTekEvaluationRunner:
-    """Batch evaluation: stream -> download WAV -> transcribe -> score -> save.
-
-    The runner can use any transcriber with a transcribe(path, output_path)
-    method returning the standard prediction dictionary.
-    """
 
     def __init__(self, transcriber: Any, evaluator: CallEvaluator | None = None,
                  audio_loader: AppTekAudioLoader | None = None):
@@ -254,8 +212,6 @@ class AppTekEvaluationRunner:
 
     def run(self, limit: int = 10, output_dir: str | Path = "results",
             rows: Any = None, reuse_predictions: bool = True) -> dict[str, Any]:
-        if limit < 1:
-            raise ValueError("limit must be at least 1")
         target = Path(output_dir)
         target.mkdir(parents=True, exist_ok=True)
         metrics: list[dict[str, Any]] = []
@@ -275,8 +231,6 @@ class AppTekEvaluationRunner:
                     audio_path = self.audio_loader.load(row)
                     prediction = self.transcriber.transcribe(audio_path, output_path)
                 score = self.evaluator.evaluate(prediction, row)
-                # Keep text references for independent, offline review in Streamlit.
-                # Reference audio is NOT included or redistributed here.
                 ref_path = target / "reference_transcripts" / f"{Path(file_name).stem}.json"
                 ref_path.parent.mkdir(parents=True, exist_ok=True)
                 ref_path.write_text(json.dumps({
@@ -296,7 +250,6 @@ class AppTekEvaluationRunner:
                 })
                 print(f"[{i}/{limit}] FAILED {file_name}: {exc}")
 
-        # Never represent an empty experiment as a successful benchmark.
         self.evaluator.save_metrics(metrics, target)
         (target / "failures.json").write_text(
             json.dumps(failures, ensure_ascii=False, indent=2), encoding="utf-8"
