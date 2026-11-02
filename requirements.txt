@@ -1,0 +1,33 @@
+# PyTorch CUDA 12.8
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.8.0+cu128
+torchaudio==2.8.0+cu128
+torchvision==0.23.0+cu128
+
+# Speech Recognition & Diarization
+whisperx==3.8.5
+pyannote.metrics==4.0.0
+
+# Scientific Computing
+numpy==2.2.6
+scipy==1.15.3
+pandas==2.3.3
+
+# Evaluation
+jiwer==4.0.0
+
+# Dataset & Audio
+datasets==4.4.1
+soundfile==0.13.1
+huggingface-hub==0.36.0
+
+# Environment
+python-dotenv==1.1.1
+
+# LLM Summarization
+groq==0.31.1
+# Dashboard
+streamlit>=1.40,<2
+
+# Excel download from evaluation dashboard
+xlsxwriter>=3.2,<4
