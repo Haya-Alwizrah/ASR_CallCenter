@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 import re
 import statistics
+from urllib.parse import quote
 from pathlib import Path
 from typing import Any
 import jiwer
@@ -47,27 +48,30 @@ class AppTekAudioLoader:
         self.local_dir = Path(local_dir)
         self._paths: list[str] | None = None
 
-    def load(self, row: dict[str, Any]) -> Path:
-        from huggingface_hub import HfApi, hf_hub_download
+    def file_path(self, row: dict[str, Any]) -> str:
+        from huggingface_hub import HfApi
 
-        relative_name = str(row.get("file_name") or "").replace("\\", "/").lstrip("/")
-        if not relative_name or ".." in Path(relative_name).parts:
-            raise ValueError(f"Invalid AppTek file_name: {relative_name!r}")
+        name = str(row.get("file_name") or "").replace("\\", "/").lstrip("/")
+        if not name or ".." in Path(name).parts:
+            raise ValueError(f"Invalid audio file name: {name}")
         if self._paths is None:
             self._paths = HfApi().list_repo_files(repo_id=self.repo_id, repo_type="dataset")
-        matches = [
-            name for name in self._paths
-            if name.startswith("diarization/") and name.endswith("/" + relative_name)
-        ]
+        matches = [p for p in self._paths if p.startswith("diarization/") and p.endswith("/" + name)]
         if len(matches) != 1:
-            raise FileNotFoundError(
-                f"Expected one diarization WAV for {relative_name!r}; "
-                f"found {len(matches)}: {matches[:5]}"
-            )
+            raise FileNotFoundError(f"Cannot find unique audio file for {name}")
+        return matches[0]
+
+    def audio_url(self, row: dict[str, Any]) -> str:
+        filename = self.file_path(row)
+        return f"https://huggingface.co/datasets/{self.repo_id}/resolve/main/{quote(filename, safe='/')}"
+
+    def load(self, row: dict[str, Any]) -> Path:
+        from huggingface_hub import hf_hub_download
+
         return Path(hf_hub_download(
             repo_id=self.repo_id,
             repo_type="dataset",
-            filename=matches[0],
+            filename=self.file_path(row),
             local_dir=str(self.local_dir),
         ))
 
@@ -210,51 +214,129 @@ class AppTekEvaluationRunner:
         self.evaluator = evaluator or CallEvaluator(normalize=True)
         self.audio_loader = audio_loader or AppTekAudioLoader()
 
+    @staticmethod
+    def save_excel(rows: list[dict], output_dir: Path) -> None:
+        import xlsxwriter
+
+        columns = [
+            ("Call ID", 27), ("Audio Link", 18), ("WhisperX Transcript", 65),
+            ("Reference Transcript", 65), ("Short Summary", 50),
+            ("Customer Issue", 45), ("Agent Action", 45), ("Outcome / Next Step", 45),
+            ("Overall Sentiment", 19), ("Beginning Sentiment", 20), ("End Sentiment", 19),
+            ("Sentiment Reason", 52), ("WER", 12), ("CER", 12), ("DER", 12),
+            ("RTF", 12), ("Duration (s)", 15), ("Processing (s)", 16),
+            ("Domain", 21), ("Accent", 16), ("Analysis Status", 25),
+        ]
+        destination = output_dir / "call_evaluation.xlsx"
+        temporary = output_dir / "call_evaluation.tmp.xlsx"
+        with xlsxwriter.Workbook(str(temporary), {"strings_to_formulas": False, "strings_to_urls": False}) as workbook:
+            sheet = workbook.add_worksheet("Call Results")
+            header = workbook.add_format({"bold": True, "font_color": "white", "bg_color": "#213955", "valign": "vcenter"})
+            text_format = workbook.add_format({"text_wrap": True, "valign": "top"})
+            link_format = workbook.add_format({"font_color": "blue", "underline": True})
+            number_format = workbook.add_format({"num_format": "0.00", "valign": "top"})
+            percent_format = workbook.add_format({"num_format": "0.00%", "valign": "top"})
+            for col, (title, width) in enumerate(columns):
+                sheet.set_column(col, col, width)
+                sheet.write(0, col, title, header)
+            sheet.set_row(0, 28)
+            sheet.freeze_panes(1, 2)
+            sheet.autofilter(0, 0, max(len(rows), 1), len(columns) - 1)
+            for index, record in enumerate(rows, start=1):
+                sheet.set_row(index, 60)
+                for col, (title, _) in enumerate(columns):
+                    value = record.get(title, "")
+                    if title == "Audio Link" and value:
+                        sheet.write_url(index, col, value, link_format, "Listen")
+                    elif isinstance(value, (int, float)):
+                        sheet.write_number(index, col, value, percent_format if title in ("WER", "CER", "DER") else number_format)
+                    else:
+                        sheet.write_string(index, col, str(value or "")[:32767], text_format)
+        temporary.replace(destination)
+
+    @staticmethod
+    def transcript_text(segments: list[dict], speaker_key: str) -> str:
+        return "\n".join(
+            f"[{float(s.get('start', 0)):.1f}-{float(s.get('end', 0)):.1f}s] "
+            f"{s.get(speaker_key) or 'UNKNOWN'}: {s.get('text', '').strip()}"
+            for s in segments
+        )
+
     def run(self, limit: int = 10, output_dir: str | Path = "results",
             rows: Any = None, reuse_predictions: bool = True) -> dict[str, Any]:
+        from src.llm import CallLLM
+
         target = Path(output_dir)
         target.mkdir(parents=True, exist_ok=True)
-        metrics: list[dict[str, Any]] = []
-        failures: list[dict[str, Any]] = []
+        metrics = []
+        failures = []
+        excel_rows = []
         source = rows if rows is not None else AppTekDataset.stream(limit=limit)
+        llm = CallLLM()
 
         for i, row in enumerate(source, start=1):
             if i > limit:
                 break
             file_name = str(row.get("file_name") or f"call_{i:03d}.wav")
+            output_path = target / f"{i:03d}_{Path(file_name).stem}.json"
+            analysis_path = target / "summaries" / f"{output_path.stem}_summary.json"
             try:
-                output_path = target / f"{i:03d}_{Path(file_name).stem}.json"
-                if reuse_predictions and output_path.is_file():
+                if reuse_predictions and output_path.exists():
                     prediction = json.loads(output_path.read_text(encoding="utf-8"))
-                    print(f"[{i}/{limit}] Reusing saved prediction: {output_path.name}")
+                    print(f"[{i}/{limit}] Reusing {output_path.name}")
                 else:
                     audio_path = self.audio_loader.load(row)
                     prediction = self.transcriber.transcribe(audio_path, output_path)
+
                 score = self.evaluator.evaluate(prediction, row)
+                metrics.append(score)
+
                 ref_path = target / "reference_transcripts" / f"{Path(file_name).stem}.json"
                 ref_path.parent.mkdir(parents=True, exist_ok=True)
                 ref_path.write_text(json.dumps({
                     "call_id": Path(file_name).stem, "file_name": file_name,
-                    "segments": [{"start": seg.get("start"), "end": seg.get("end"),
-                                  "speaker": seg.get("speaker_id"), "text": seg.get("text", "")}
-                                 for seg in row.get("segments", [])],
+                    "segments": [{"start": s.get("start"), "end": s.get("end"),
+                                  "speaker": s.get("speaker_id"), "text": s.get("text", "")}
+                                 for s in row.get("segments", [])],
                 }, ensure_ascii=False, indent=2), encoding="utf-8")
-                metrics.append(score)
-                print(f"[{i}/{limit}] WER={score['wer']:.3f} | "
-                      f"CER={score['cer']:.3f} | DER={score['der']:.3f} | "
-                      f"RTF={score['rtf'] if score['rtf'] is not None else 'N/A'}")
-            except Exception as exc:
-                failures.append({
-                    "call_index": i, "file_name": file_name,
-                    "error_type": type(exc).__name__, "error": str(exc),
+
+                analysis = {}
+                status = "Complete"
+                try:
+                    analysis = llm.analyze(prediction, analysis_path, reuse=reuse_predictions)
+                except Exception as error:
+                    status = f"LLM pending: {type(error).__name__}"
+                    print(f"[{i}/{limit}] {status}: {error}")
+
+                summary = analysis.get("summary") or {}
+                sentiment = analysis.get("sentiment") or {}
+                excel_rows.append({
+                    "Call ID": prediction.get("call_id") or output_path.stem,
+                    "Audio Link": self.audio_loader.audio_url(row),
+                    "WhisperX Transcript": self.transcript_text(prediction["segments"], "speaker"),
+                    "Reference Transcript": self.transcript_text(row["segments"], "speaker_id"),
+                    "Short Summary": summary.get("short_summary"),
+                    "Customer Issue": summary.get("customer_issue"),
+                    "Agent Action": summary.get("agent_action"),
+                    "Outcome / Next Step": summary.get("final_outcome_or_next_step"),
+                    "Overall Sentiment": sentiment.get("label"),
+                    "Beginning Sentiment": sentiment.get("beginning"),
+                    "End Sentiment": sentiment.get("end"),
+                    "Sentiment Reason": sentiment.get("justification"),
+                    "WER": score["wer"], "CER": score["cer"], "DER": score["der"],
+                    "RTF": score["rtf"], "Duration (s)": score["duration_seconds"],
+                    "Processing (s)": score["processing_seconds"],
+                    "Domain": score["domain"], "Accent": score["accent"],
+                    "Analysis Status": status,
                 })
-                print(f"[{i}/{limit}] FAILED {file_name}: {exc}")
+                self.save_excel(excel_rows, target)
+                print(f"[{i}/{limit}] WER={score['wer']:.3f} CER={score['cer']:.3f} DER={score['der']:.3f} | Excel saved")
+            except Exception as error:
+                failures.append({"call_index": i, "file_name": file_name, "error": str(error)})
+                print(f"[{i}/{limit}] FAILED {file_name}: {error}")
 
         self.evaluator.save_metrics(metrics, target)
-        (target / "failures.json").write_text(
-            json.dumps(failures, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        metric_names = ("wer", "cer", "der", "rtf")
+        (target / "failures.json").write_text(json.dumps(failures, indent=2), encoding="utf-8")
         summary = {
             "requested_calls": limit,
             "successful_calls": len(metrics),
@@ -263,16 +345,11 @@ class AppTekEvaluationRunner:
             "overall": self.evaluator.aggregate(metrics),
             "mean": {}, "std": {},
         }
-        for name in metric_names:
+        for name in ("wer", "cer", "der", "rtf"):
             values = [float(m[name]) for m in metrics if m.get(name) is not None]
             summary["mean"][name] = statistics.mean(values) if values else None
             summary["std"][name] = statistics.stdev(values) if len(values) > 1 else None
-        (target / "summary.json").write_text(
-            json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        print("\nOVERALL (pooled across successful calls):")
-        for name in metric_names:
-            value = summary["overall"][name]
-            print(f"  {name.upper()}: {value:.4f}" if value is not None else f"  {name.upper()}: N/A")
-        print(f"Completed: {len(metrics)} successful / {len(failures)} failed")
+        (target / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        self.save_excel(excel_rows, target)
+        print(f"Excel: {target / 'call_evaluation.xlsx'} ({len(excel_rows)} calls)")
         return {"summary": summary, "metrics": metrics, "failures": failures}

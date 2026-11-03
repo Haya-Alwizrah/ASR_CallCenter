@@ -78,8 +78,7 @@ class CallLLM:
             if not str(seg.get("text", "")).strip():
                 continue
             speaker = seg.get("speaker") or "UNKNOWN"
-            lines.append(f"[{number}] {float(seg.get('start') or 0):.2f}-{float(seg.get('end') or 0):.2f}s "
-                         f"{speaker}: {seg['text']}")
+            lines.append(f"[{number}] {speaker}: {seg['text']}")
 
         transcript = "\n".join(lines)
         response = self.client.chat.completions.create(

@@ -11,6 +11,7 @@ def build_transcriber(*, keep_asr_loaded: bool | None = None):
     from src.pipeline import CallCenterWhisperX
 
     token = os.getenv("HF_TOKEN", "").strip()
+    
     device = os.getenv("DEVICE", "auto")
     compute = os.getenv("COMPUTE_TYPE", "auto")
     speakers = os.getenv("NUM_SPEAKERS", "2")
@@ -58,7 +59,7 @@ def main() -> None:
     p_eval = sub.add_parser("evaluate", help="Run pooled AppTek WER/CER/DER/RTF evaluation")
     p_eval.add_argument("--limit", type=int, default=10)
     p_eval.add_argument("--output-dir", type=Path, default=None)
-    p_eval.add_argument("--reuse", action="store_true", help="Reuse matching prediction JSON files")
+    p_eval.add_argument("--reuse", action="store_true", help="Reuse saved transcripts and LLM results")
     p_analysis = sub.add_parser("analyze", help="Summarize + analyze customer sentiment on saved transcripts")
     analysis_input = p_analysis.add_mutually_exclusive_group(required=True)
     analysis_input.add_argument("--input", type=Path, help="Single WhisperX prediction JSON")
